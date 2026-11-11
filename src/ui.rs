@@ -258,10 +258,26 @@ pub fn open(s: &mut Ui, tx: &mut Tx) {
         s.me.place(DisplayTarget::UnderPointer, placement);
     }
     s.me.open();
+    time_reveal(&s.me);
     s.phase = Phase::Shown;
     s.hold_caret(tx);
     tx.scroll_to_x("strip", 0.0);
     s.sync_images();
+}
+
+/// With `NERDA_CLIPBOARD_DEBUG` set, reports how long the shelf took to reach the screen
+/// after the shortcut asked for it.
+fn time_reveal(me: &AppHandle<Ui>) {
+    if !crate::debugging() || me.is_visible() {
+        return;
+    }
+    let (me, asked) = (me.clone(), std::time::Instant::now());
+    std::thread::spawn(move || {
+        while !me.is_visible() && asked.elapsed().as_secs() < 2 {
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        crate::debug(|| format!("shelf on screen {:.1} ms after the shortcut", asked.elapsed().as_secs_f64() * 1e3));
+    });
 }
 
 pub fn close(s: &mut Ui, tx: &mut Tx) {

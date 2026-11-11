@@ -37,10 +37,15 @@ const HEADLESS: [&str; 12] = [
 #[global_allocator]
 static ALLOCATOR: alloc::Returning = alloc::Returning;
 
+/// Whether `NERDA_CLIPBOARD_DEBUG` is set.
+fn debugging() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("NERDA_CLIPBOARD_DEBUG").is_some());
+    *ON
+}
+
 /// Prints a diagnostic line when `NERDA_CLIPBOARD_DEBUG` is set.
 fn debug(message: impl FnOnce() -> String) {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("NERDA_CLIPBOARD_DEBUG").is_some());
-    if *ON {
+    if debugging() {
         eprintln!("nerda-clipboard: {}", message());
     }
 }
