@@ -61,8 +61,10 @@ pub enum Read {
     Captured(Capture),
     /// Nothing to record, for good: private, written by this app, or too large.
     Skipped,
-    /// Nothing this app records: an empty pasteboard, or only types it doesn't keep.
+    /// Only types this app doesn't keep, or types whose data isn't there yet.
     Empty,
+    /// No types at all: the pasteboard was cleared, and its new content may still be on the way.
+    Blank,
 }
 
 /// The pasteboard's current content.
@@ -70,6 +72,9 @@ pub fn read() -> Read {
     autoreleasepool(|_| {
         let pb = NSPasteboard::generalPasteboard();
         let types: Vec<String> = pb.types().map(|t| t.iter().map(|s| s.to_string()).collect()).unwrap_or_default();
+        if types.is_empty() {
+            return Read::Blank;
+        }
         if types.iter().any(|t| t == OWN || SKIPPED.contains(&t.as_str())) {
             return Read::Skipped;
         }

@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -14,6 +14,13 @@ use crate::pasteboard::{self, Capture, Read};
 
 /// How often the pasteboard's change count is checked; macOS has no change notification.
 const POLL: Duration = Duration::from_millis(200);
+/// Chromium clears the pasteboard first and writes the copy later under the same change count:
+/// tens of milliseconds later for text, seconds for a large image it has to encode. So a change
+/// that reads as nothing is read again: this often at first, then at the usual pace, for as
+/// long as `BLANK_WAIT` while the pasteboard has no types and `EMPTY_WAIT` once it has some.
+const RETRY: Duration = Duration::from_millis(40);
+const EMPTY_WAIT: Duration = Duration::from_secs(2);
+const BLANK_WAIT: Duration = Duration::from_secs(60);
 /// Copies at least this large have the allocator's spare memory returned afterwards.
 const LARGE_COPY: usize = 256 << 10;
 /// From writing the pasteboard to pressing ⌘V: long enough for the shelf to hide and the app
@@ -71,27 +78,47 @@ pub fn spawn(dir: PathBuf, config: Config, sink: impl Fn(Event) + Send + 'static
             // What was copied before launch isn't recorded.
             let mut seen = pasteboard::change_count();
             let mut paused = false;
+            // When the current change count was first seen, while it still reads as nothing.
+            let mut waiting: Option<Instant> = None;
             loop {
-                match rx.recv_timeout(POLL) {
+                let pace = if waiting.is_some_and(|since| since.elapsed() < EMPTY_WAIT) { RETRY } else { POLL };
+                match rx.recv_timeout(pace) {
                     Ok(op) => {
+                        let before = seen;
                         if let Err(e) = apply(&db, op, &mut seen, &mut paused, &sink) {
                             eprintln!("nerda-clipboard: history: {e}");
+                        }
+                        if seen != before {
+                            waiting = None;
                         }
                     }
                     Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => return,
                 }
                 let count = pasteboard::change_count();
-                if count == seen {
-                    continue;
+                if count != seen {
+                    crate::debug(|| format!("pasteboard changed: {seen} -> {count}"));
+                    seen = count;
+                    waiting = (!paused).then(Instant::now);
                 }
-                crate::debug(|| format!("pasteboard changed: {seen} -> {count}"));
-                seen = count;
-                if paused {
-                    continue;
-                }
-                let found = pasteboard::read();
-                let Read::Captured(capture) = found else { continue };
+                let Some(since) = waiting else { continue };
+                let capture = match pasteboard::read() {
+                    Read::Captured(capture) => capture,
+                    Read::Skipped => {
+                        waiting = None;
+                        continue;
+                    }
+                    found @ (Read::Empty | Read::Blank) => {
+                        let limit = if matches!(found, Read::Blank) { BLANK_WAIT } else { EMPTY_WAIT };
+                        if since.elapsed() > limit {
+                            crate::debug(|| format!("change {count} brought nothing to record"));
+                            waiting = None;
+                        }
+                        continue;
+                    }
+                };
+                crate::debug(|| format!("recorded change {count} after {:.0} ms", since.elapsed().as_secs_f64() * 1e3));
+                waiting = None;
                 if config.ignored_apps.iter().any(|id| id.eq_ignore_ascii_case(&capture.bundle_id)) {
                     continue;
                 }
