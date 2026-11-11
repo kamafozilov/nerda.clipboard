@@ -4,14 +4,12 @@
 use rune::{Color, Cx, El, Family, Icon, Spring, SurfaceFit, TextStyle, col, el, icon, row, spacer, text, text_input};
 
 use crate::model::{Entry, Filter, Kind, ago, link_host};
-use crate::ui::{self, MARGIN, PANEL_H, Phase, Ui, card_key};
+use crate::ui::{self, CARD_PITCH, CARD_W, MARGIN, PANEL_H, Phase, STRIP_PAD, Ui, card_key, strip_width};
 
 const RADIUS: f32 = 26.0;
 const HEADER_H: f32 = 52.0;
 const FOOTER_H: f32 = 40.0;
-pub const CARD_W: f32 = 236.0;
 pub const CARD_H: f32 = PANEL_H - HEADER_H - FOOTER_H - 12.0;
-const CARD_GAP: f32 = 12.0;
 /// How far below its place the panel starts when it opens.
 const RISE: f32 = 36.0;
 const FILE_ROWS: usize = 6;
@@ -176,11 +174,20 @@ fn header(s: &Ui, l: &Look) -> El {
 }
 
 fn strip(s: &Ui, l: &Look, listed: &[usize]) -> El {
-    let mut cards = row().key("cards").h_full().px(16.0).gap(CARD_GAP).center_y();
-    for (position, &i) in listed.iter().enumerate() {
-        cards = cards.child(card(s, l, &s.entries[i], position));
+    let range = s.mounted_now(listed.len());
+    let mut cards = el().key("cards").w(strip_width(listed.len())).h_full().on_layout_tx(|s: &mut Ui, rect, tx| ui::strip_moved(s, rect[0], tx));
+    for position in range {
+        let x = STRIP_PAD + position as f32 * CARD_PITCH;
+        cards = cards.child(card(s, l, &s.entries[listed[position]], position).absolute(x, 6.0));
     }
-    el().key("strip").w_full().h(CARD_H + 12.0).scroll_x().scroll_edge_fade(18.0).scroll_margin(16.0).child(cards)
+    let scroll = s.scroll.clone();
+    el().key("strip")
+        .w_full()
+        .h(CARD_H + 12.0)
+        .scroll_x()
+        .scroll_edge_fade(18.0)
+        .on_scroll_offset(move |at| scroll.set([at.offset[0], at.viewport[0]]))
+        .child(cards)
 }
 
 fn empty(s: &Ui, l: &Look) -> El {
@@ -296,14 +303,8 @@ fn card(s: &Ui, l: &Look, e: &Entry, position: usize) -> El {
         .preserve_focus_on_press(true)
         .on_press_tx(move |s: &mut Ui, tx| ui::select_card(s, id, tx))
         .on_double_press_tx(move |s: &mut Ui, tx| ui::paste_card(s, id, tx))
-        .on_visible(move |s: &mut Ui, visible, _| {
-            if visible {
-                s.on_screen.insert(id);
-            } else {
-                s.on_screen.remove(&id);
-            }
-            s.sync_images();
-        })
+        // A card coming into view is when the pictures around it are worth loading.
+        .on_visible(|s: &mut Ui, _, _| s.sync_images())
         .child(head)
         .child(body)
         .child(foot)

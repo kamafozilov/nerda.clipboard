@@ -4,12 +4,13 @@
 use std::ffi::c_void;
 
 use objc2::rc::{Retained, autoreleasepool};
-use objc2::runtime::ProtocolObject;
+use objc2::{AnyThread, msg_send};
+use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2_app_kit::{
     NSBitmapImageFileType, NSBitmapImageRep, NSEvent, NSPasteboard, NSPasteboardItem, NSPasteboardWriting, NSScreen,
     NSWorkspace,
 };
-use objc2_foundation::{MainThreadMarker, NSArray, NSData, NSDictionary, NSNumber, NSString, NSURL};
+use objc2_foundation::{MainThreadMarker, NSArray, NSAttributedString, NSData, NSDictionary, NSNumber, NSString, NSURL};
 
 use crate::model::{Kind, classify_text};
 
@@ -55,19 +56,34 @@ pub fn change_count() -> isize {
     NSPasteboard::generalPasteboard().changeCount()
 }
 
-/// The pasteboard's current content, or `None` when it's empty, marked private, written by
-/// this app, or larger than a history should hold.
-pub fn read() -> Option<Capture> {
+/// What a look at the pasteboard found.
+pub enum Read {
+    Captured(Capture),
+    /// Nothing to record, for good: private, written by this app, or too large.
+    Skipped,
+    /// Nothing this app records: an empty pasteboard, or only types it doesn't keep.
+    Empty,
+}
+
+/// The pasteboard's current content.
+pub fn read() -> Read {
     autoreleasepool(|_| {
         let pb = NSPasteboard::generalPasteboard();
         let types: Vec<String> = pb.types().map(|t| t.iter().map(|s| s.to_string()).collect()).unwrap_or_default();
         if types.iter().any(|t| t == OWN || SKIPPED.contains(&t.as_str())) {
-            return None;
+            return Read::Skipped;
         }
         let has = |uti: &str| types.iter().any(|t| t == uti);
-        let data = |uti: &str, max: usize| pb.dataForType(&ns(uti)).map(|d| d.to_vec()).filter(|d| !d.is_empty() && d.len() <= max);
+        // The size is checked on the pasteboard's own data, before any of it is copied.
+        let data = |uti: &str, max: usize| -> Result<Option<Vec<u8>>, ()> {
+            match pb.dataForType(&ns(uti)) {
+                Some(d) if d.length() > max => Err(()),
+                Some(d) if d.length() > 0 => Ok(Some(d.to_vec())),
+                _ => Ok(None),
+            }
+        };
         let (app_name, app_path, bundle_id) = frontmost_app();
-        let capture = |kind, text: String, color, reps| Some(Capture { kind, text, color, reps, app_name: app_name.clone(), app_path: app_path.clone(), bundle_id: bundle_id.clone() });
+        let capture = |kind, text: String, color, reps| Read::Captured(Capture { kind, text, color, reps, app_name: app_name.clone(), app_path: app_path.clone(), bundle_id: bundle_id.clone() });
 
         let urls = file_urls(&pb);
         if !urls.is_empty() {
@@ -75,21 +91,64 @@ pub fn read() -> Option<Capture> {
             return capture(Kind::Files, paths.join("\n"), None, vec![(FILE_URL.to_owned(), urls.join("\n").into_bytes())]);
         }
 
-        if let Some(text) = pb.stringForType(&ns(TEXT)).map(|s| s.to_string()).filter(|s| !s.trim().is_empty() && s.len() <= MAX_TEXT_BYTES) {
+        let rtf = if has(RTF) { data(RTF, MAX_RICH_BYTES) } else { Ok(None) };
+        let plain = match data(TEXT, MAX_TEXT_BYTES) {
+            Err(()) => return Read::Skipped,
+            Ok(bytes) => bytes.and_then(|b| String::from_utf8(b).ok()),
+        };
+        // Rich text copied without a plain form still has words: take them from the RTF.
+        let text = plain.or_else(|| rtf.as_ref().ok().and_then(|r| r.as_deref()).and_then(rtf_text)).filter(|t| !t.trim().is_empty());
+        if let Some(text) = text {
             let (kind, color) = classify_text(&text);
             let mut reps = vec![(TEXT.to_owned(), text.clone().into_bytes())];
-            for uti in [RTF, HTML] {
-                if has(uti) && let Some(d) = data(uti, MAX_RICH_BYTES) {
-                    reps.push((uti.to_owned(), d));
-                }
+            if let Ok(Some(rtf)) = rtf {
+                reps.push((RTF.to_owned(), rtf));
+            }
+            if has(HTML) && let Ok(Some(html)) = data(HTML, MAX_RICH_BYTES) {
+                reps.push((HTML.to_owned(), html));
             }
             return capture(kind, text, color, reps);
         }
 
-        let png = if has(PNG) { data(PNG, MAX_IMAGE_BYTES) } else { None }
-            .or_else(|| if has(TIFF) { data(TIFF, MAX_IMAGE_BYTES).and_then(|tiff| to_png(&tiff)) } else { None })?;
-        capture(Kind::Image, String::new(), None, vec![(PNG.to_owned(), png)])
+        let png = if has(PNG) { data(PNG, MAX_IMAGE_BYTES) } else { Ok(None) };
+        let png = match png {
+            Err(()) => return Read::Skipped,
+            Ok(Some(png)) => Some(png),
+            Ok(None) if has(TIFF) => match data(TIFF, MAX_IMAGE_BYTES) {
+                Err(()) => return Read::Skipped,
+                Ok(tiff) => tiff.and_then(|tiff| to_png(&tiff)),
+            },
+            Ok(None) => None,
+        };
+        match png {
+            Some(png) => capture(Kind::Image, String::new(), None, vec![(PNG.to_owned(), png)]),
+            None => {
+                crate::debug(|| format!("nothing to record on the pasteboard: {types:?}"));
+                Read::Empty
+            }
+        }
     })
+}
+
+/// The words of an RTF document.
+fn rtf_text(rtf: &[u8]) -> Option<String> {
+    let data = NSData::with_bytes(rtf);
+    // SAFETY: `initWithRTF:documentAttributes:` accepts a null attributes out-pointer and
+    // returns nil for data that isn't RTF.
+    let parsed: Option<Retained<NSAttributedString>> =
+        unsafe { msg_send![NSAttributedString::alloc(), initWithRTF: &*data, documentAttributes: std::ptr::null_mut::<*mut AnyObject>()] };
+    parsed.map(|text| text.string().to_string())
+}
+
+/// Hands memory the allocator is holding after a large copy back to the system, so one big
+/// image or text doesn't leave the app's footprint at its peak.
+pub fn release_memory() {
+    unsafe extern "C" {
+        fn malloc_zone_pressure_relief(zone: *mut c_void, goal: usize) -> usize;
+    }
+    // SAFETY: a null zone means every zone, and a goal of 0 means as much as possible.
+    let released = unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
+    crate::debug(|| format!("released {} KB to the system", released / 1024));
 }
 
 fn file_urls(pb: &NSPasteboard) -> Vec<String> {

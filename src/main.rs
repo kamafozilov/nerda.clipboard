@@ -10,6 +10,9 @@
 #[cfg(not(target_os = "macos"))]
 compile_error!("Nerda Clipboard is a macOS app.");
 
+mod alloc;
+#[cfg(test)]
+mod bench;
 mod config;
 mod demo;
 mod model;
@@ -30,6 +33,17 @@ const HEADLESS: [&str; 12] = [
     "--snap", "--tree", "--trace", "--script", "--video", "--frames", "--strip", "--out", "--first-pixels",
     "--list-scenes", "--list-windows", "--desktop",
 ];
+
+#[global_allocator]
+static ALLOCATOR: alloc::Returning = alloc::Returning;
+
+/// Prints a diagnostic line when `NERDA_CLIPBOARD_DEBUG` is set.
+fn debug(message: impl FnOnce() -> String) {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("NERDA_CLIPBOARD_DEBUG").is_some());
+    if *ON {
+        eprintln!("nerda-clipboard: {}", message());
+    }
+}
 
 fn main() {
     rune::prewarm_gpu();

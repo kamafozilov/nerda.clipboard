@@ -1,7 +1,9 @@
 //! The shelf's state and behaviour: what is listed, what is selected, how keys act on it,
 //! and when the panel shows and hides.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::rc::Rc;
 
 use rune::{AppHandle, DisplayTarget, Image, ImageCache, Key, KeyEvent, OverlayPlacement, SystemMaterial, TextEdit, Tx, Waker};
@@ -22,10 +24,32 @@ pub const WINDOW_H: f32 = PANEL_H + SHADOW_ROOM + MARGIN;
 const CLOSE_SECONDS: f64 = 0.14;
 /// Half of the caret's blink cycle, as AppKit's insertion point.
 const BLINK_SECONDS: f64 = 0.53;
-/// Thumbnails are kept for the cards on screen and this many either side of them.
-const THUMB_MARGIN: usize = 4;
-/// Cards whose thumbnails stay loaded while the shelf is hidden, so it opens complete.
-const WARM_CARDS: usize = 8;
+/// A card, and the strip of them: only the cards near the viewport are built, so the shelf
+/// costs the same however long the history is.
+pub const CARD_W: f32 = 236.0;
+pub const CARD_GAP: f32 = 12.0;
+pub const CARD_PITCH: f32 = CARD_W + CARD_GAP;
+/// Space before the first card and after the last.
+pub const STRIP_PAD: f32 = 16.0;
+/// Cards built beyond each edge of the viewport, so a scroll never shows a gap.
+pub const OVERSCAN: usize = 4;
+/// The viewport's width before its first layout reports one.
+pub const FALLBACK_VIEWPORT: f32 = 1512.0;
+/// How many cards one step of the built range spans.
+pub const STEP: usize = 2;
+
+/// The width of a strip of `count` cards.
+pub fn strip_width(count: usize) -> f32 {
+    2.0 * STRIP_PAD + count as f32 * CARD_PITCH - if count > 0 { CARD_GAP } else { 0.0 }
+}
+
+/// The positions of the cards to build for a viewport `viewport` wide scrolled to `offset`.
+pub fn mounted(offset: f32, viewport: f32, count: usize) -> Range<usize> {
+    let first = ((offset - STRIP_PAD).max(0.0) / CARD_PITCH) as usize;
+    let visible = (viewport / CARD_PITCH).ceil() as usize + 1;
+    let from = first.saturating_sub(OVERSCAN).min(count);
+    from..(first + visible + OVERSCAN).min(count)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Phase {
@@ -53,7 +77,11 @@ pub struct Ui {
     pub images: Option<Rc<ImageCache>>,
     pub thumbs: HashMap<i64, Image>,
     pub icons: HashMap<String, Image>,
-    pub on_screen: HashSet<i64>,
+    /// The strip's scroll offset and viewport width, as its last frame drew it.
+    pub scroll: Rc<Cell<[f32; 2]>>,
+    /// Which [`STEP`]-card stretch of the strip the viewport starts in: what the built range
+    /// follows, so a scroll re-runs the view once per step, not once per frame.
+    pub step: usize,
     pub notice: Option<String>,
     pub paused: bool,
     /// The search caret's blink: whether it shows, and when it next flips.
@@ -80,7 +108,8 @@ impl Ui {
             images: None,
             thumbs: HashMap::new(),
             icons: HashMap::new(),
-            on_screen: HashSet::new(),
+            scroll: Rc::new(Cell::new([0.0, 0.0])),
+            step: 0,
             notice: None,
             paused: false,
             caret_on: true,
@@ -120,21 +149,9 @@ impl Ui {
     pub fn sync_images(&mut self) {
         let Some(cache) = self.images.clone() else { return };
         let listed = self.listed();
-        let mut wanted: HashSet<i64> = HashSet::new();
-        let mut want_around = |position: usize| {
-            let from = position.saturating_sub(THUMB_MARGIN);
-            let to = (position + THUMB_MARGIN + 1).min(listed.len());
-            wanted.extend(listed[from.min(to)..to].iter().map(|&i| self.entries[i].id));
-        };
-        want_around(self.selected.min(WARM_CARDS / 2));
-        if self.phase != Phase::Hidden {
-            want_around(self.selected);
-            for (position, &i) in listed.iter().enumerate() {
-                if self.on_screen.contains(&self.entries[i].id) {
-                    want_around(position);
-                }
-            }
-        }
+        // Hidden, the shelf keeps what its first cards need, so it opens complete.
+        let range = if self.phase == Phase::Hidden { mounted(0.0, FALLBACK_VIEWPORT, listed.len()) } else { self.mounted_now(listed.len()) };
+        let wanted: HashSet<i64> = listed[range].iter().map(|&i| self.entries[i].id).collect();
         self.thumbs.retain(|id, _| wanted.contains(id));
         for entry in &self.entries {
             if wanted.contains(&entry.id)
@@ -156,14 +173,32 @@ impl Ui {
         self.icons.retain(|path, _| used.contains(path.as_str()));
     }
 
+    fn viewport(&self) -> [f32; 2] {
+        let [offset, width] = self.scroll.get();
+        [offset, if width > 0.0 { width } else { FALLBACK_VIEWPORT }]
+    }
+
+    /// The cards built right now: the viewport from the start of its step, a step wider.
+    pub fn mounted_now(&self, count: usize) -> Range<usize> {
+        let span = STEP as f32 * CARD_PITCH;
+        mounted(self.step as f32 * span + STRIP_PAD, self.viewport()[1] + span, count)
+    }
+
     fn select(&mut self, position: usize, tx: &mut Tx) {
-        let listed = self.listed();
-        if listed.is_empty() {
+        let count = self.listed().len();
+        if count == 0 {
             self.selected = 0;
             return;
         }
-        self.selected = position.min(listed.len() - 1);
-        tx.scroll_into_view(card_key(self.entries[listed[self.selected]].id));
+        self.selected = position.min(count - 1);
+        // Scroll by position, not by key: the card may not be built yet.
+        let [offset, width] = self.viewport();
+        let left = STRIP_PAD + self.selected as f32 * CARD_PITCH;
+        if left - STRIP_PAD < offset {
+            tx.scroll_to("strip", left - STRIP_PAD, 0.0);
+        } else if left + CARD_W + STRIP_PAD > offset + width {
+            tx.scroll_to("strip", left + CARD_W + STRIP_PAD - width, 0.0);
+        }
         self.sync_images();
     }
 
@@ -172,6 +207,18 @@ impl Ui {
         self.selected = 0;
         tx.scroll_to_x("strip", 0.0);
         self.sync_images();
+    }
+}
+
+/// The strip's content moved to `x` in the window: a scroll. Only crossing into another
+/// step changes what is built; any other frame of the scroll leaves the view alone.
+pub fn strip_moved(s: &mut Ui, x: f32, tx: &mut Tx) {
+    let step = ((MARGIN - x).max(0.0) / (CARD_PITCH * STEP as f32)) as usize;
+    if step == s.step {
+        tx.live_only();
+    } else {
+        s.step = step;
+        s.sync_images();
     }
 }
 
@@ -195,7 +242,8 @@ pub fn open(s: &mut Ui, tx: &mut Tx) {
     s.query.clear();
     s.query.focused = true;
     s.selected = 0;
-    s.on_screen.clear();
+    s.scroll.set([0.0, s.scroll.get()[1]]);
+    s.step = 0;
     if s.notice.is_some() && pasteboard::can_paste(false) {
         s.notice = None;
     }
@@ -230,7 +278,6 @@ pub fn poll(s: &mut Ui, clock: f64, tx: &mut Tx) -> bool {
         Phase::Closing { due } if clock >= due => {
             s.phase = Phase::Hidden;
             s.me.hide();
-            s.on_screen.clear();
             s.selected = 0;
             s.caret_on = true;
             s.sync_images();
@@ -509,5 +556,47 @@ mod tests {
         assert!(animated > 2, "frames_to_rest sees animation: {animated}");
         assert!(instant <= 2, "an instant blink draws {instant} frames");
         assert!(instant <= plain);
+    }
+
+    fn long_history(count: usize) -> Runtime<Ui> {
+        let mut rt = runtime();
+        let base = rt.state.entries.clone();
+        rt.state.entries = (0..count).map(|i| { let mut e = base[i % base.len()].clone(); e.id = i as i64 + 1; e.thumb = None; e }).collect();
+        rt.frame(1.0 / 60.0);
+        rt
+    }
+
+    fn built(rt: &Runtime<Ui>, id: i64) -> bool {
+        rt.presented(&card_key(id)).is_some()
+    }
+
+    #[test]
+    fn only_the_cards_near_the_viewport_are_built() {
+        let mut rt = long_history(300);
+        assert!(built(&rt, 1) && built(&rt, 5));
+        assert!(!built(&rt, 40) && !built(&rt, 300));
+        // Jumping to the end scrolls there and builds the last cards instead.
+        key(&mut rt, Key::End, Mods::default());
+        for _ in 0..240 { rt.frame(1.0 / 120.0); }
+        assert_eq!(rt.state.selected, 299);
+        assert!(built(&rt, 300) && built(&rt, 296), "the last cards are built");
+        assert!(!built(&rt, 1), "the first cards are gone");
+        let [x, _, w, _] = rt.presented(&card_key(300)).unwrap().0;
+        assert!(x >= 0.0 && x + w <= 1280.0, "the selected card is on screen: {x}..{}", x + w);
+        // And back, a card at a time.
+        for _ in 0..12 { key(&mut rt, Key::Left, Mods::default()); }
+        for _ in 0..120 { rt.frame(1.0 / 120.0); }
+        let [x, _, w, _] = rt.presented(&card_key(288)).unwrap().0;
+        assert!(x >= 0.0 && x + w <= 1280.0, "the selected card is on screen: {x}..{}", x + w);
+    }
+
+    #[test]
+    fn the_mounted_range_covers_the_viewport_with_overscan() {
+        assert_eq!(mounted(0.0, 1240.0, 1000), 0..10);
+        assert_eq!(mounted(CARD_PITCH * 50.0 + STRIP_PAD, 1240.0, 1000), 46..60);
+        assert_eq!(mounted(0.0, 1240.0, 3), 0..3);
+        assert_eq!(mounted(99_999.0, 1240.0, 20), 20..20);
+        assert_eq!(strip_width(0), 2.0 * STRIP_PAD);
+        assert_eq!(strip_width(2), 2.0 * STRIP_PAD + 2.0 * CARD_W + CARD_GAP);
     }
 }

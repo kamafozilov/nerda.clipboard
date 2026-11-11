@@ -10,10 +10,12 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::config::Config;
 use crate::model::{Entry, Kind, PREVIEW_CHARS, SEARCH_CHARS, bytes_label, clip};
-use crate::pasteboard::{self, Capture};
+use crate::pasteboard::{self, Capture, Read};
 
 /// How often the pasteboard's change count is checked; macOS has no change notification.
-const POLL: Duration = Duration::from_millis(350);
+const POLL: Duration = Duration::from_millis(200);
+/// Copies at least this large have the allocator's spare memory returned afterwards.
+const LARGE_COPY: usize = 256 << 10;
 /// From writing the pasteboard to pressing ⌘V: long enough for the shelf to hide and the app
 /// behind it to take the keyboard back.
 const PASTE_DELAY: Duration = Duration::from_millis(240);
@@ -83,24 +85,32 @@ pub fn spawn(dir: PathBuf, config: Config, sink: impl Fn(Event) + Send + 'static
                 if count == seen {
                     continue;
                 }
+                crate::debug(|| format!("pasteboard changed: {seen} -> {count}"));
                 seen = count;
                 if paused {
                     continue;
                 }
-                let Some(capture) = pasteboard::read() else { continue };
+                let found = pasteboard::read();
+                let Read::Captured(capture) = found else { continue };
                 if config.ignored_apps.iter().any(|id| id.eq_ignore_ascii_case(&capture.bundle_id)) {
                     continue;
                 }
+                let large = capture.reps.iter().map(|(_, data)| data.len()).sum::<usize>() >= LARGE_COPY;
                 match db.record(&capture) {
                     Ok(entry) => {
                         sink(Event::Captured(entry));
-                        match db.trim(config.max_items) {
+                        match db.trim(config.max_items, config.max_image_mb << 20) {
                             Ok(gone) if !gone.is_empty() => sink(Event::Trimmed(gone)),
                             Ok(_) => {}
                             Err(e) => eprintln!("nerda-clipboard: history: {e}"),
                         }
                     }
                     Err(e) => eprintln!("nerda-clipboard: history: {e}"),
+                }
+                drop(capture);
+                if large {
+                    db.shrink();
+                    pasteboard::release_memory();
                 }
             }
         })
@@ -119,6 +129,12 @@ fn apply(db: &Db, op: Op, seen: &mut isize, paused: &mut bool, sink: &impl Fn(Ev
                 return Ok(());
             }
             *seen = pasteboard::write(&reps);
+            let large = reps.iter().map(|(_, data)| data.len()).sum::<usize>() >= LARGE_COPY;
+            drop(reps);
+            if large {
+                db.shrink();
+                pasteboard::release_memory();
+            }
             if let Some(entry) = db.touch(id)? {
                 sink(Event::Captured(entry));
             }
@@ -152,7 +168,7 @@ fn unix_millis() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
 
-struct Db {
+pub(crate) struct Db {
     conn: Connection,
     thumbs: PathBuf,
 }
@@ -160,12 +176,15 @@ struct Db {
 const COLUMNS: &str = "id, kind, preview, search, detail, app_name, app_path, used, pinned, color, has_thumb";
 
 impl Db {
-    fn open(dir: &Path) -> Result<Db, Box<dyn std::error::Error>> {
+    pub(crate) fn open(dir: &Path) -> Result<Db, Box<dyn std::error::Error>> {
         let thumbs = dir.join("thumbs");
         std::fs::create_dir_all(&thumbs)?;
         let conn = Connection::open(dir.join("history.db"))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", true)?;
+        // Payloads are megabytes: keep SQLite's page cache and write-ahead log small.
+        conn.pragma_update(None, "cache_size", -2048)?;
+        conn.pragma_update(None, "journal_size_limit", 1 << 20)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS items(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -192,6 +211,11 @@ impl Db {
         Ok(Db { conn, thumbs })
     }
 
+    /// Folds the write-ahead log into the database file, so the file alone is the history.
+    pub(crate) fn checkpoint(&self) {
+        let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+    }
+
     fn thumb_path(&self, id: i64) -> PathBuf {
         self.thumbs.join(format!("{id}.png"))
     }
@@ -216,7 +240,7 @@ impl Db {
         })
     }
 
-    fn entries(&self) -> rusqlite::Result<Vec<Entry>> {
+    pub(crate) fn entries(&self) -> rusqlite::Result<Vec<Entry>> {
         let mut query = self.conn.prepare(&format!("SELECT {COLUMNS} FROM items ORDER BY used DESC, id DESC"))?;
         query.query_map([], |row| self.entry(row))?.collect()
     }
@@ -232,7 +256,7 @@ impl Db {
     }
 
     /// Stores a copy. The same content copied again moves its entry to the front instead.
-    fn record(&self, capture: &Capture) -> rusqlite::Result<Entry> {
+    pub(crate) fn record(&self, capture: &Capture) -> rusqlite::Result<Entry> {
         let main = capture.reps.first().map_or(&[][..], |(_, data)| data.as_slice());
         let hash = blake3::hash(main);
         let known: Option<i64> = self.conn.query_row("SELECT id FROM items WHERE hash = ?1", [hash.as_bytes().as_slice()], |row| row.get(0)).optional()?;
@@ -274,7 +298,7 @@ impl Db {
         self.by_id(id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
     }
 
-    fn reps(&self, id: i64) -> rusqlite::Result<Vec<(String, Vec<u8>)>> {
+    pub(crate) fn reps(&self, id: i64) -> rusqlite::Result<Vec<(String, Vec<u8>)>> {
         // Plain text first: it's written with `setString`, the rest as data.
         let mut query = self.conn.prepare("SELECT uti, data FROM reps WHERE item_id = ?1 ORDER BY uti = ?2 DESC")?;
         query.query_map(params![id, pasteboard::TEXT], |row| Ok((row.get(0)?, row.get(1)?)))?.collect()
@@ -296,12 +320,40 @@ impl Db {
         self.conn.execute_batch("VACUUM")
     }
 
-    /// Drops the oldest unpinned entries beyond `max` and returns their ids.
-    fn trim(&self, max: usize) -> rusqlite::Result<Vec<i64>> {
-        self.drop_where(
+    /// Drops the oldest unpinned entries beyond `max`, then the oldest unpinned images beyond
+    /// `image_budget` bytes of image data, and returns the ids of both.
+    pub(crate) fn trim(&self, max: usize, image_budget: u64) -> rusqlite::Result<Vec<i64>> {
+        let mut gone = self.drop_where(
             "pinned = 0 AND id NOT IN (SELECT id FROM items WHERE pinned = 0 ORDER BY used DESC, id DESC LIMIT ?1)",
-            [max as i64],
-        )
+            [i64::try_from(max).unwrap_or(i64::MAX)],
+        )?;
+        let over: Vec<i64> = {
+            let mut query = self.conn.prepare(
+                "SELECT id, (SELECT COALESCE(SUM(LENGTH(data)), 0) FROM reps WHERE item_id = items.id)
+                 FROM items WHERE kind = 'image' AND pinned = 0 ORDER BY used DESC, id DESC",
+            )?;
+            let mut total = 0u64;
+            let sizes = query.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            // The newest image always stays, however large.
+            sizes.into_iter().enumerate().filter_map(|(i, (id, bytes))| {
+                total += bytes as u64;
+                (i > 0 && total > image_budget).then_some(id)
+            }).collect()
+        };
+        for id in over {
+            self.delete(id)?;
+            gone.push(id);
+        }
+        if !gone.is_empty() {
+            self.checkpoint();
+        }
+        Ok(gone)
+    }
+
+    /// Returns SQLite's caches to the allocator after a large read or write.
+    fn shrink(&self) {
+        let _ = self.conn.execute_batch("PRAGMA shrink_memory");
+        self.checkpoint();
     }
 
     fn drop_where<P: rusqlite::Params + Clone>(&self, condition: &str, params: P) -> rusqlite::Result<Vec<i64>> {
@@ -432,7 +484,7 @@ mod tests {
             })
             .collect();
         db.pin(ids[0], true).unwrap();
-        let gone = db.trim(2).unwrap();
+        let gone = db.trim(2, u64::MAX).unwrap();
         assert_eq!(gone.len(), 2);
         let left: Vec<i64> = db.entries().unwrap().iter().map(|e| e.id).collect();
         assert_eq!(left, vec![ids[4], ids[3], ids[0]]);
@@ -471,6 +523,34 @@ mod tests {
         assert!(entry.detail.starts_with("1600 × 400"));
         let thumb = image::open(entry.thumb.unwrap()).unwrap();
         assert_eq!((thumb.width(), thumb.height()), (640, 160));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_image_budget_drops_the_oldest_images_but_never_the_newest() {
+        let (db, dir) = temp_db("budget");
+        let image = |seed: u8| {
+            let mut png = Vec::new();
+            image::DynamicImage::new_rgba8(64, 64).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+            png.extend(std::iter::repeat_n(seed, 10_000));
+            png
+        };
+        let ids: Vec<i64> = (0..4u8)
+            .map(|i| {
+                let id = db.record(&capture(Kind::Image, "", vec![(pasteboard::PNG, &image(i))])).unwrap().id;
+                db.conn.execute("UPDATE items SET used = ?2 WHERE id = ?1", params![id, i]).unwrap();
+                id
+            })
+            .collect();
+        let note = db.record(&text("a note stays")).unwrap().id;
+        // Room for two of the four images.
+        let gone = db.trim(100, 25_000).unwrap();
+        assert_eq!(gone, vec![ids[1], ids[0]]);
+        assert!(gone.iter().all(|id| !dir.join(format!("thumbs/{id}.png")).exists()));
+        let left: Vec<i64> = db.entries().unwrap().iter().map(|e| e.id).collect();
+        assert_eq!(left, vec![note, ids[3], ids[2]]);
+        // A budget smaller than one image still keeps the newest.
+        assert_eq!(db.trim(100, 1).unwrap(), vec![ids[2]]);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

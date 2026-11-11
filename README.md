@@ -55,11 +55,16 @@ every rebuild, so set `SIGN_IDENTITY` for `scripts/bundle.sh` to keep the permis
 ```json
 {
   "shortcut": "cmd+shift+v",
-  "max_items": 500,
+  "max_items": 200,
+  "max_image_mb": 256,
   "ignored_apps": ["com.apple.keychainaccess", "com.apple.Passwords", "com.1password.1password", "com.bitwarden.desktop"],
-  "material": "glass"
+  "material": "glass",
+  "menu_bar_icon": "clipboard"
 }
 ```
+
+`max_items` is how many unpinned entries are kept, and `max_image_mb` how much copied image
+data; past either, the oldest unpinned entries go. Pinned entries always stay.
 
 `material` is `glass` (Liquid Glass on macOS 26 and later) or `popover` (frosted vibrancy).
 The history lives beside it in `history.db`, with thumbnails in `thumbs/`.
@@ -74,6 +79,21 @@ target/release/nerda-clipboard --snap search.png --scene search
 target/release/nerda-clipboard --list-scenes
 ```
 
+## Measuring
+
+`src/bench.rs` holds measurements rather than checks: what recording each kind of copy costs,
+what a thumbnail costs to show, and how the history file, launch and the shelf's frames scale
+from 100 to 5,000 entries.
+
+```sh
+cargo test --release -- --ignored --nocapture --test-threads 1 bench::
+```
+
+Only the cards near the viewport are built, so a frame costs the same at 100 entries as at
+5,000 (about 0.2 to 0.5 ms of CPU for an arrow key) and the hidden app stays near 45 MB.
+`NERDA_CLIPBOARD_DIR=/some/dir` runs against another history, and `NERDA_CLIPBOARD_DEBUG=1`
+prints what the history thread sees.
+
 ## Layout
 
 - `src/main.rs`: wiring, window options, the global shortcut
@@ -82,4 +102,6 @@ target/release/nerda-clipboard --list-scenes
 - `src/store.rs`: the history thread (SQLite, thumbnails, pasteboard polling)
 - `src/pasteboard.rs`: `NSPasteboard`, the frontmost app, the ⌘V keystroke
 - `src/status_item.rs`: the menu bar icon
+- `src/alloc.rs`: the allocator that returns large blocks to the system when freed
 - `src/model.rs`, `src/config.rs`, `src/demo.rs`: entries, settings, sample data
+- `src/bench.rs`: measurements

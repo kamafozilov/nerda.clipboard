@@ -11,6 +11,8 @@ pub struct Config {
     pub shortcut: String,
     /// How many unpinned entries the history keeps.
     pub max_items: usize,
+    /// How many megabytes of copied images the history keeps; the oldest unpinned go first.
+    pub max_image_mb: u64,
     /// Bundle ids whose copies are never recorded.
     pub ignored_apps: Vec<String>,
     /// "glass" (Liquid Glass on macOS 26 and later) or "popover" (frosted vibrancy).
@@ -23,7 +25,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             shortcut: "cmd+shift+v".to_owned(),
-            max_items: 500,
+            max_items: 200,
+            max_image_mb: 256,
             ignored_apps: vec![
                 "com.apple.keychainaccess".to_owned(),
                 "com.apple.Passwords".to_owned(),
@@ -36,8 +39,12 @@ impl Default for Config {
     }
 }
 
-/// `~/Library/Application Support/nerda.clipboard`.
+/// `~/Library/Application Support/nerda.clipboard`, or `NERDA_CLIPBOARD_DIR` when set: a
+/// second history for trying things without touching the real one.
 pub fn data_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("NERDA_CLIPBOARD_DIR").filter(|d| !d.is_empty()) {
+        return PathBuf::from(dir);
+    }
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
     home.join("Library/Application Support/nerda.clipboard")
 }
@@ -77,7 +84,8 @@ mod tests {
     fn missing_fields_take_their_defaults() {
         let config: Config = serde_json::from_str(r#"{"shortcut": "alt+space"}"#).unwrap();
         assert_eq!(config.shortcut, "alt+space");
-        assert_eq!(config.max_items, 500);
+        assert_eq!(config.max_items, 200);
+        assert_eq!(config.max_image_mb, 256);
         assert_eq!(config.material, "glass");
     }
 }
