@@ -23,6 +23,7 @@ libc = "0.2"
 objc2 = "0.6"
 objc2-foundation = "0.3"
 objc2-app-kit = "0.3"
+block2 = "0.6"
 
 # Rune builds against its own patched wgpu-hal; a dependency's [patch] does not reach this
 # workspace, so repeat it here with the same rev as `rune` above.

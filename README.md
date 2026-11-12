@@ -96,8 +96,7 @@ A click selects a card and a double click pastes it.
   "max_items": 200,
   "max_image_mb": 256,
   "ignored_apps": ["com.apple.keychainaccess", "com.apple.Passwords", "com.1password.1password", "com.bitwarden.desktop"],
-  "material": "glass",
-  "menu_bar_icon": "clipboard"
+  "material": "glass"
 }
 ```
 

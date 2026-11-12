@@ -1659,6 +1659,7 @@ name = "nerda-clipboard"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "block2 0.6.2",
  "image",
  "libc",
  "objc2 0.6.5",

@@ -17,8 +17,6 @@ pub struct Config {
     pub ignored_apps: Vec<String>,
     /// "glass" (Liquid Glass on macOS 26 and later) or "popover" (frosted vibrancy).
     pub material: String,
-    /// The SF Symbol shown in the menu bar; chosen from the menu's Menu Bar Icon list.
-    pub menu_bar_icon: String,
 }
 
 impl Default for Config {
@@ -34,7 +32,6 @@ impl Default for Config {
                 "com.bitwarden.desktop".to_owned(),
             ],
             material: "glass".to_owned(),
-            menu_bar_icon: "clipboard".to_owned(),
         }
     }
 }
@@ -66,8 +63,8 @@ pub fn load(dir: &Path) -> Config {
     }
 }
 
-/// Writes `dir/config.json`, for a setting changed from the menu.
-pub fn save(dir: &Path, config: &Config) {
+/// Writes `dir/config.json`.
+fn save(dir: &Path, config: &Config) {
     if std::fs::create_dir_all(dir).is_ok()
         && let Ok(text) = serde_json::to_string_pretty(config)
         && let Err(e) = std::fs::write(dir.join("config.json"), text + "\n")
@@ -87,5 +84,12 @@ mod tests {
         assert_eq!(config.max_items, 200);
         assert_eq!(config.max_image_mb, 256);
         assert_eq!(config.material, "glass");
+    }
+
+    #[test]
+    fn settings_files_from_older_versions_still_load() {
+        // `menu_bar_icon` was a setting until the icon became fixed.
+        let config: Config = serde_json::from_str(r#"{"shortcut": "alt+space", "menu_bar_icon": "scissors"}"#).unwrap();
+        assert_eq!(config.shortcut, "alt+space");
     }
 }

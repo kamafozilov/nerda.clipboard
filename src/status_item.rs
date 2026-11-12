@@ -1,44 +1,30 @@
 //! The menu bar icon and its menu. Rune has no macOS status item yet, so this is AppKit.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
+
+use block2::RcBlock;
 use std::path::PathBuf;
 
 use objc2::rc::Retained;
-use objc2::runtime::{AnyClass, AnyObject, NSObject, NSObjectProtocol, ProtocolObject, Sel};
+use objc2::runtime::{AnyClass, AnyObject, Bool, NSObject, NSObjectProtocol, ProtocolObject, Sel};
 use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSControlStateValueOff, NSControlStateValueOn, NSEventModifierFlags, NSImage, NSMenu, NSMenuDelegate, NSMenuItem,
-    NSStatusBar, NSStatusItem, NSWorkspace,
+    NSBezierPath, NSColor, NSControlStateValueOff, NSControlStateValueOn, NSEventModifierFlags, NSImage, NSLineCapStyle,
+    NSMenu, NSMenuDelegate, NSMenuItem, NSStatusBar, NSWorkspace,
 };
-use objc2_foundation::{MainThreadMarker, NSError, NSString, NSURL};
+use objc2_foundation::{MainThreadMarker, NSError, NSPoint, NSRect, NSSize, NSString, NSURL};
 use rune::AppHandle;
 
-use crate::config::{self, Config};
+use crate::config::Config;
 use crate::ui::{self, Ui};
-
-/// Menu bar icons to choose from: the name shown in the menu and its SF Symbol.
-pub const ICONS: [(&str, &str); 8] = [
-    ("Clipboard", "clipboard"),
-    ("Filled Clipboard", "clipboard.fill"),
-    ("Checklist", "list.clipboard"),
-    ("Document on Clipboard", "doc.on.clipboard"),
-    ("Documents", "doc.on.doc"),
-    ("Paperclip", "paperclip"),
-    ("Scissors", "scissors"),
-    ("Tray", "tray.full"),
-];
 
 const TAG_PAUSE: isize = 1;
 const TAG_LOGIN: isize = 2;
-/// An icon item's tag is this plus its index in [`ICONS`].
-const TAG_ICON: isize = 100;
 
 struct Ivars {
     app: AppHandle<Ui>,
     data_dir: PathBuf,
-    config: RefCell<Config>,
     paused: Cell<bool>,
-    status: Retained<NSStatusItem>,
 }
 
 define_class!(
@@ -75,17 +61,6 @@ define_class!(
             }
         }
 
-        #[unsafe(method(pickIcon:))]
-        fn pick_icon(&self, sender: Option<&NSMenuItem>) {
-            let Some((_, symbol)) = sender.and_then(|item| ICONS.get((item.tag() - TAG_ICON) as usize)) else { return };
-            let ivars = self.ivars();
-            ivars.config.borrow_mut().menu_bar_icon = (*symbol).to_owned();
-            config::save(&ivars.data_dir, &ivars.config.borrow());
-            if let Some(mtm) = MainThreadMarker::new() {
-                set_icon(&ivars.status, symbol, mtm);
-            }
-        }
-
         #[unsafe(method(openSettings:))]
         fn open_settings(&self, _sender: Option<&AnyObject>) {
             open_path(&self.ivars().data_dir.join("config.json"));
@@ -117,10 +92,6 @@ define_class!(
             };
             check(menu, TAG_PAUSE, ivars.paused.get());
             check(menu, TAG_LOGIN, login_item::enabled());
-            let current = ivars.config.borrow().menu_bar_icon.clone();
-            for (i, (_, symbol)) in ICONS.iter().enumerate() {
-                check(menu, TAG_ICON + i as isize, *symbol == current);
-            }
         }
     }
 );
@@ -130,18 +101,37 @@ fn open_path(path: &std::path::Path) {
     NSWorkspace::sharedWorkspace().openURL(&NSURL::fileURLWithPath(&path));
 }
 
-fn symbol_image(symbol: &str) -> Option<Retained<NSImage>> {
-    let image = NSImage::imageWithSystemSymbolName_accessibilityDescription(&NSString::from_str(symbol), Some(&NSString::from_str("Nerda Clipboard")))?;
-    image.setTemplate(true);
-    Some(image)
-}
+/// The menu bar icon: a clipboard with two more edges stacked behind it, for a history
+/// rather than a single copy. Drawn as a template on an 18 pt square, the size of the
+/// system's own menu bar icons, with their 1.5 pt stroke; AppKit tints it for the bar.
+fn menu_bar_image() -> Retained<NSImage> {
+    let draw = RcBlock::new(|_rect: NSRect| -> Bool {
+        let point = |x: f64, y: f64| NSPoint::new(x, y);
+        let rounded = |x: f64, y: f64, w: f64, h: f64, r: f64| {
+            NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(NSRect::new(point(x, y), NSSize::new(w, h)), r, r)
+        };
+        NSColor::blackColor().set();
 
-fn set_icon(status: &NSStatusItem, symbol: &str, mtm: MainThreadMarker) {
-    let Some(button) = status.button(mtm) else { return };
-    match symbol_image(symbol).or_else(|| symbol_image(ICONS[0].1)) {
-        Some(image) => button.setImage(Some(&image)),
-        None => button.setTitle(&NSString::from_str("⌘V")),
-    }
+        let board = rounded(1.75, 3.75, 10.5, 12.5, 2.0);
+        board.setLineWidth(1.5);
+        board.stroke();
+        rounded(4.5, 2.0, 5.0, 3.0, 1.0).fill();
+
+        let edges = NSBezierPath::bezierPath();
+        edges.moveToPoint(point(14.5, 5.5));
+        edges.lineToPoint(point(14.5, 14.5));
+        edges.moveToPoint(point(16.75, 7.25));
+        edges.lineToPoint(point(16.75, 12.75));
+        edges.setLineWidth(1.5);
+        edges.setLineCapStyle(NSLineCapStyle::Round);
+        edges.stroke();
+        Bool::YES
+    });
+    // Flipped, so the coordinates read top-down like the SVG the shape was drawn in.
+    let image = NSImage::imageWithSize_flipped_drawingHandler(NSSize::new(18.0, 18.0), true, &draw);
+    image.setTemplate(true);
+    image.setAccessibilityDescription(Some(&NSString::from_str("Nerda Clipboard")));
+    image
 }
 
 /// A Rune chord ("cmd+shift+v") as a menu key equivalent, when its key is one character.
@@ -166,10 +156,12 @@ fn key_equivalent(chord: &str) -> Option<(String, NSEventModifierFlags)> {
 pub fn install(app: AppHandle<Ui>, data_dir: PathBuf, config: Config) {
     let Some(mtm) = MainThreadMarker::new() else { return };
     let status = NSStatusBar::systemStatusBar().statusItemWithLength(-1.0);
-    set_icon(&status, &config.menu_bar_icon, mtm);
-    let shortcut = config.shortcut.clone();
+    if let Some(button) = status.button(mtm) {
+        button.setImage(Some(&menu_bar_image()));
+    }
+    let shortcut = config.shortcut;
 
-    let target = Target::alloc(mtm).set_ivars(Ivars { app, data_dir, config: RefCell::new(config), paused: Cell::new(false), status: status.clone() });
+    let target = Target::alloc(mtm).set_ivars(Ivars { app, data_dir, paused: Cell::new(false) });
     // SAFETY: NSObject's `init` on a freshly allocated subclass instance.
     let target: Retained<Target> = unsafe { msg_send![super(target), init] };
 
@@ -212,19 +204,6 @@ pub fn install(app: AppHandle<Ui>, data_dir: PathBuf, config: Config) {
     }
     menu.addItem(&login);
 
-    let icons = NSMenu::new(mtm);
-    for (i, (name, symbol)) in ICONS.iter().enumerate() {
-        let choice = tagged(item(name, sel!(pickIcon:)), TAG_ICON + i as isize);
-        choice.setImage(symbol_image(symbol).as_deref());
-        icons.addItem(&choice);
-    }
-    icons.setDelegate(Some(ProtocolObject::from_ref(&*target)));
-    let icon_item = item("Menu Bar Icon", sel!(pickIcon:));
-    // SAFETY: a submenu's parent item needs no action.
-    unsafe { icon_item.setAction(None) };
-    icon_item.setSubmenu(Some(&icons));
-    menu.addItem(&icon_item);
-
     menu.addItem(&item("Open Settings File", sel!(openSettings:)));
     menu.addItem(&item("Show Data Folder", sel!(showData:)));
 
@@ -237,7 +216,7 @@ pub fn install(app: AppHandle<Ui>, data_dir: PathBuf, config: Config) {
     status.setMenu(Some(&menu));
 
     // The icon lives as long as the app: AppKit holds none of these strongly.
-    std::mem::forget((status, menu, icons, target));
+    std::mem::forget((status, menu, target));
 }
 
 /// Launch at login through `SMAppService.mainApp` (macOS 13 and later).
